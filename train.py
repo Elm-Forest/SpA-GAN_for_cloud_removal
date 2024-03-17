@@ -12,6 +12,7 @@ from torch import optim
 from torch.utils.data import DataLoader
 from torch.autograd import Variable
 from torch.nn import functional as F
+from torch.cuda.amp import GradScaler, autocast
 
 from data_manager import TrainDataset
 from models.gen.SPANet import Generator
@@ -36,9 +37,11 @@ def train(config):
     train_dataset, validation_dataset = torch.utils.data.random_split(dataset, [train_size, validation_size])
     print('train dataset:', len(train_dataset))
     print('validation dataset:', len(validation_dataset))
-    training_data_loader = DataLoader(dataset=train_dataset, num_workers=config.threads, batch_size=config.batchsize, shuffle=True)
-    validation_data_loader = DataLoader(dataset=validation_dataset, num_workers=config.threads, batch_size=config.validation_batchsize, shuffle=False)
-    
+    training_data_loader = DataLoader(dataset=train_dataset, num_workers=config.threads, batch_size=config.batchsize,
+                                      shuffle=True)
+    validation_data_loader = DataLoader(dataset=validation_dataset, num_workers=config.threads,
+                                        batch_size=config.validation_batchsize, shuffle=False)
+
     ### MODELS LOAD ###
     print('===> Loading models')
 
@@ -85,7 +88,9 @@ def train(config):
     validationreport = TestReport(log_dir=config.out_dir)
 
     print('===> begin')
-    start_time=time.time()
+    start_time = time.time()
+
+    scaler = GradScaler()
     # main
     for epoch in range(1, config.epoch + 1):
         epoch_start_time = time.time()
@@ -94,62 +99,64 @@ def train(config):
             real_a.data.resize_(real_a_cpu.size()).copy_(real_a_cpu)
             real_b.data.resize_(real_b_cpu.size()).copy_(real_b_cpu)
             M.data.resize_(M_cpu.size()).copy_(M_cpu)
-            att, fake_b = gen.forward(real_a)
+            # att, fake_b = gen.forward(real_a)
 
             ################
             ### Update D ###
             ################
-            
+
             opt_dis.zero_grad()
+            with autocast():
+                # 在更新D之前，获得fake_b
+                att, fake_b = gen(real_a)
+                fake_ab = torch.cat((real_a, fake_b), 1)
+                pred_fake = dis(fake_ab.detach())
+                batchsize, _, w, h = pred_fake.size()
+                loss_d_fake = torch.sum(criterionSoftplus(pred_fake)) / batchsize / w / h
 
-            # train with fake
-            fake_ab = torch.cat((real_a, fake_b), 1)
-            pred_fake = dis.forward(fake_ab.detach())
-            batchsize, _, w, h = pred_fake.size()
+                real_ab = torch.cat((real_a, real_b), 1)
+                pred_real = dis(real_ab)
+                loss_d_real = torch.sum(criterionSoftplus(-pred_real)) / batchsize / w / h
 
-            loss_d_fake = torch.sum(criterionSoftplus(pred_fake)) / batchsize / w / h
+                # Combined D loss
+                loss_d = loss_d_fake + loss_d_real
 
-            # train with real
-            real_ab = torch.cat((real_a, real_b), 1)
-            pred_real = dis.forward(real_ab)
-            loss_d_real = torch.sum(criterionSoftplus(-pred_real)) / batchsize / w / h
-
-            # Combined loss
-            loss_d = loss_d_fake + loss_d_real
-
-            loss_d.backward()
-
+            scaler.scale(loss_d).backward()
             if epoch % config.minimax == 0:
-                opt_dis.step()
+                scaler.step(opt_dis)
+                scaler.update()
+                opt_dis.zero_grad()
 
             ################
             ### Update G ###
             ################
-            
             opt_gen.zero_grad()
+            with autocast():
+                # 再次获得fake_b，确保在更新G时具有正确的梯度
+                _, fake_b = gen(real_a)
+                fake_ab = torch.cat((real_a, fake_b), 1)
+                pred_fake = dis(fake_ab)
+                loss_g_gan = torch.sum(criterionSoftplus(-pred_fake)) / batchsize / w / h
 
-            # First, G(A) should fake the discriminator
-            fake_ab = torch.cat((real_a, fake_b), 1)
-            pred_fake = dis.forward(fake_ab)
-            loss_g_gan = torch.sum(criterionSoftplus(-pred_fake)) / batchsize / w / h
+                loss_g_l1 = criterionL1(fake_b, real_b) * config.lamb
+                loss_g_att = criterionMSE(att[:, 0, :, :], M)
+                loss_g = loss_g_gan + loss_g_l1 + loss_g_att
 
-            # Second, G(A) = B
-            loss_g_l1 = criterionL1(fake_b, real_b) * config.lamb
-            loss_g_att = criterionMSE(att[:,0,:,:], M)
-            loss_g = loss_g_gan + loss_g_l1 + loss_g_att
-
-            loss_g.backward()
-
-            opt_gen.step()
+            scaler.scale(loss_g).backward()
+            scaler.step(opt_gen)
+            scaler.update()
+            opt_gen.zero_grad()
 
             # log
             if iteration % 10 == 0:
-                print("===> Epoch[{}]({}/{}): loss_d_fake: {:.4f} loss_d_real: {:.4f} loss_g_gan: {:.4f} loss_g_l1: {:.4f}".format(
-                epoch, iteration, len(training_data_loader), loss_d_fake.item(), loss_d_real.item(), loss_g_gan.item(), loss_g_l1.item()))
-                
+                print(
+                    "===> Epoch[{}]({}/{}): loss_d_fake: {:.4f} loss_d_real: {:.4f} loss_g_gan: {:.4f} loss_g_l1: {:.4f}".format(
+                        epoch, iteration, len(training_data_loader), loss_d_fake.item(), loss_d_real.item(),
+                        loss_g_gan.item(), loss_g_l1.item()))
+
                 log = {}
                 log['epoch'] = epoch
-                log['iteration'] = len(training_data_loader) * (epoch-1) + iteration
+                log['iteration'] = len(training_data_loader) * (epoch - 1) + iteration
                 log['gen/loss'] = loss_g.item()
                 log['dis/loss'] = loss_d.item()
 
