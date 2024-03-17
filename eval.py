@@ -47,7 +47,7 @@ def test(config, test_data_loader, gen, criterionMSE, epoch):
         img1 = np.tensordot(out.cpu().numpy()[0, :3].transpose(1, 2, 0), [0.298912, 0.586611, 0.114478], axes=1)
         img2 = np.tensordot(t.cpu().numpy()[0, :3].transpose(1, 2, 0), [0.298912, 0.586611, 0.114478], axes=1)
         
-        ssim = SSIM(img1, img2)
+        ssim = SSIM(img1, img2, data_range=img1.max() - img1.min())
         avg_mse += mse.item()
         avg_psnr += psnr
         avg_ssim += ssim
